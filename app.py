@@ -34,6 +34,7 @@ query Search($mpn: String!, $country: String!, $currency: String!) {
           company { name isVerified }
           isAuthorized
           offers {
+            clickUrl
             inventoryLevel
             moq
             factoryLeadDays
@@ -86,6 +87,7 @@ def build_rows(part, qty):
             total = round(price * buy_qty, 2) if price is not None else None
             rows.append({
                 "Tarnija": company.get("name") or "—",
+                "Telli": offer.get("clickUrl"),
                 "Autoriseeritud": bool(seller.get("isAuthorized")),
                 "Kontrollitud ettevõte": bool(company.get("isVerified")),
                 "Laoseis": stock,
@@ -146,6 +148,8 @@ if st.button("Otsi turuandmeid", type="primary"):
                             f"Odavaim kuvatud sobiv pakkumine: {best['Tarnija']} — "
                             f"{int(best['Ostukogus'])} tk × €{best['Ühiku hind EUR']:.4f} = €{best['Kogukulu EUR']:.2f}."
                         )
+                        if pd.notna(best.get("Telli")) and str(best.get("Telli")).startswith(("http://", "https://")):
+                            st.link_button(f"Ava parim pakkumine — {best['Tarnija']}", str(best["Telli"]), type="primary")
 
                     if filtered.empty:
                         st.warning("Valitud filtritega sobivaid pakkumisi ei ole. Eemalda mõni filter ja otsi uuesti; sama MPN-i tulemus on 30 minutit vahemälus.")
@@ -158,6 +162,9 @@ if st.button("Otsi turuandmeid", type="primary"):
                             use_container_width=True,
                             hide_index=True,
                             column_config={
+                                "Telli": st.column_config.LinkColumn(
+                                    "Telli", display_text="Ava pakkumine ↗"
+                                ),
                                 "Ühiku hind EUR": st.column_config.NumberColumn(format="€%.4f"),
                                 "Kogukulu EUR": st.column_config.NumberColumn(format="€%.2f"),
                             },
@@ -178,4 +185,4 @@ if st.button("Otsi turuandmeid", type="primary"):
             st.error(f"Otsing ebaõnnestus: {e}")
 
 st.divider()
-st.caption("V3 • Autoriseeritud tarnijad • laoseis • MOQ • kogukulu • CSV eksport • 30 min päringuvahemälu")
+st.caption("V4 • Otselink tarnija pakkumisele • autoriseeritud tarnijad • laoseis • MOQ • kogukulu • CSV eksport")
