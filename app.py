@@ -1,46 +1,119 @@
-import streamlit as st
+import requests
 import pandas as pd
-from io import BytesIO
+import streamlit as st
+
+TOKEN_URL = "https://identity.nexar.com/connect/token"
+GRAPHQL_URL = "https://api.nexar.com/graphql"
 
 st.set_page_config(page_title="Oshino OÜ Osturobot", page_icon="🔎", layout="wide")
-
 st.title("Oshino OÜ Osturobot")
-st.caption("Elektroonikakomponentide ostu ja saadavuse piloot")
+st.caption("Päris Nexar / Octopart turuandmed • Eesti • EUR")
 
-st.info("DEMO-režiim: praegu ei kasutata veel reaalajas TrustedPartsi/Octoparti API andmeid.")
+@st.cache_data(ttl=82800, show_spinner=False)
+def get_token(client_id, client_secret):
+    r = requests.post(TOKEN_URL, data={
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scope": "supply.domain"
+    }, timeout=30)
+    r.raise_for_status()
+    return r.json()["access_token"]
 
-tab1, tab2 = st.tabs(["Komponendi otsing", "BOM analüüs"])
+QUERY = """
+query Search($mpn: String!, $country: String!, $currency: String!) {
+  supSearchMpn(q: $mpn, country: $country, currency: $currency, limit: 1) {
+    hits
+    results {
+      part {
+        mpn
+        name
+        manufacturer { name }
+        totalAvail
+        sellers {
+          company { name isVerified }
+          isAuthorized
+          offers {
+            inventoryLevel
+            moq
+            factoryLeadDays
+            packaging
+            prices { quantity convertedPrice convertedCurrency }
+          }
+        }
+      }
+    }
+  }
+}
+"""
 
-with tab1:
-    mpn = st.text_input("Tootja tootekood (MPN)", placeholder="Näiteks STM32F407VGT6")
-    qty = st.number_input("Vajalik kogus", min_value=1, value=100, step=1)
-    if st.button("Otsi komponenti", type="primary"):
-        if not mpn.strip():
-            st.warning("Sisesta MPN.")
-        else:
-            demo = pd.DataFrame([
-                {"Allikas":"TrustedParts (DEMO)", "MPN":mpn.upper(), "Laoseis":1250, "Hind €/tk":4.82, "MOQ":1, "Tarneaeg":"Laos"},
-                {"Allikas":"DigiKey (DEMO)", "MPN":mpn.upper(), "Laoseis":480, "Hind €/tk":5.10, "MOQ":1, "Tarneaeg":"Laos"},
-                {"Allikas":"Mouser (DEMO)", "MPN":mpn.upper(), "Laoseis":0, "Hind €/tk":4.95, "MOQ":1, "Tarneaeg":"12 nädalat"},
-            ])
-            demo["Piisab koguseks"] = demo["Laoseis"] >= qty
-            st.dataframe(demo, use_container_width=True, hide_index=True)
-            available = demo[demo["Piisab koguseks"]]
-            if len(available):
-                best = available.sort_values("Hind €/tk").iloc[0]
-                st.success(f"DEMO soovitus: {best['Allikas']} — {best['Hind €/tk']:.2f} €/tk, laos {int(best['Laoseis'])} tk.")
-            else:
-                st.error("DEMO: ükski kuvatud allikas ei kata kogu kogust.")
+def search(mpn):
+    token = get_token(st.secrets["NEXAR_CLIENT_ID"], st.secrets["NEXAR_CLIENT_SECRET"])
+    r = requests.post(
+        GRAPHQL_URL,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"query": QUERY, "variables": {"mpn": mpn, "country": "EE", "currency": "EUR"}},
+        timeout=45,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("errors"):
+        raise RuntimeError(data["errors"][0].get("message", str(data["errors"])))
+    return data["data"]["supSearchMpn"]
 
-with tab2:
-    uploaded = st.file_uploader("Laadi BOM CSV või XLSX", type=["csv","xlsx"])
-    if uploaded:
+def price_for_qty(prices, qty):
+    choices = []
+    for p in prices or []:
+        if p.get("quantity") is not None and p.get("convertedPrice") is not None and p["quantity"] <= qty:
+            choices.append((p["quantity"], p["convertedPrice"], p.get("convertedCurrency") or "EUR"))
+    return max(choices, key=lambda x: x[0])[1:] if choices else (None, None)
+
+mpn = st.text_input("Tootja tootekood (MPN)", placeholder="STM32F407VGT6")
+qty = st.number_input("Vajalik kogus", min_value=1, value=100, step=1)
+
+if st.button("Otsi päris turuandmeid", type="primary"):
+    if not mpn.strip():
+        st.warning("Sisesta MPN.")
+    else:
         try:
-            df = pd.read_csv(uploaded) if uploaded.name.lower().endswith(".csv") else pd.read_excel(uploaded)
-            st.dataframe(df, use_container_width=True)
-            st.caption("Järgmises versioonis otsib robot iga MPN-i kohta päris laoseisu, hinda ja tarneaega.")
+            with st.spinner("Küsin Nexar/Octopart andmeid..."):
+                result = search(mpn.strip())
+            results = result.get("results") or []
+            if not results:
+                st.warning("MPN-i kohta tulemust ei leitud.")
+            else:
+                part = results[0]["part"]
+                maker = (part.get("manufacturer") or {}).get("name", "")
+                st.subheader(f"{part.get('mpn', mpn)} — {maker}")
+                st.metric("Nexari kogusaadavus", part.get("totalAvail", 0))
+
+                rows = []
+                for seller in part.get("sellers") or []:
+                    company = seller.get("company") or {}
+                    for offer in seller.get("offers") or []:
+                        price, currency = price_for_qty(offer.get("prices"), qty)
+                        stock = offer.get("inventoryLevel")
+                        rows.append({
+                            "Tarnija": company.get("name"),
+                            "Autoriseeritud": seller.get("isAuthorized"),
+                            "Laoseis": stock,
+                            "MOQ": offer.get("moq"),
+                            "Pakend": offer.get("packaging"),
+                            "Lead time (päeva)": offer.get("factoryLeadDays"),
+                            f"Hind @ {qty}": price,
+                            "Valuuta": currency,
+                            "Katab koguse": isinstance(stock, (int, float)) and stock >= qty,
+                        })
+
+                if rows:
+                    df = pd.DataFrame(rows)
+                    df = df.sort_values(["Katab koguse", f"Hind @ {qty}"], ascending=[False, True], na_position="last")
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Komponent leiti, kuid pakkumisi ei tagastatud.")
+                st.caption("Andmeallikas: Nexar / Octopart. Kontrolli enne ostu tarnija lõplik pakkumine.")
         except Exception as e:
-            st.error(f"Faili lugemine ebaõnnestus: {e}")
+            st.error(f"Otsing ebaõnnestus: {e}")
 
 st.divider()
-st.caption("V1 piloot • päris turuandmed lisame API võtmetega järgmises etapis.")
+st.caption("V2 • BOM massotsingu lisame järgmises etapis, et Evaluation limiiti mitte asjatult kulutada.")
